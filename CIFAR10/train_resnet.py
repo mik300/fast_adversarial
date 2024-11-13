@@ -9,10 +9,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from apex import amp
+from pathlib import Path
 
-from preact_resnet import PreActResNet18
-from utils import (upper_limit, lower_limit, std, clamp, get_loaders,
+
+from fast_adversarial.CIFAR10.utils import (upper_limit, lower_limit, std, clamp, get_loaders,
     attack_pgd, evaluate_pgd, evaluate_standard)
+from neural_networks.CIFAR10.resnet import resnet8, resnet20, resnet32, resnet56
+from neural_networks.utils import get_loaders_split, evaluate_test_accuracy, calibrate_model, load_scaling_factors
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,7 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch-size', default=128, type=int)
     parser.add_argument('--data-dir', default='./data', type=str)
-    parser.add_argument('--epochs', default=15, type=int)
+    parser.add_argument('--epochs', default=5, type=int)
     parser.add_argument('--lr-schedule', default='cyclic', choices=['cyclic', 'multistep'])
     parser.add_argument('--lr-min', default=0., type=float)
     parser.add_argument('--lr-max', default=0.2, type=float)
@@ -31,7 +34,7 @@ def get_args():
     parser.add_argument('--alpha', default=10, type=float, help='Step size')
     parser.add_argument('--delta-init', default='random', choices=['zero', 'random', 'previous'],
         help='Perturbation initialization method')
-    parser.add_argument('--out-dir', default='train_fgsm_output', type=str, help='Output directory')
+    parser.add_argument('--out-dir', default='./fast_adversarial/log', type=str, help='Output directory')
     parser.add_argument('--seed', default=0, type=int, help='Random seed')
     parser.add_argument('--early-stop', action='store_true', help='Early stop if overfitting occurs')
     parser.add_argument('--opt-level', default='O2', type=str, choices=['O0', 'O1', 'O2'],
@@ -40,15 +43,47 @@ def get_args():
         help='If loss_scale is "dynamic", adaptively adjust the loss scale over time')
     parser.add_argument('--master-weights', action='store_true',
         help='Maintain FP32 master weights to accompany any FP16 model weights, not applicable for O1 opt level')
+    parser.add_argument('--neural_network', default="resnet8", type=str, help="Choose one from resnet8, resnet20, resnet32, resnet56")
+    parser.add_argument('--act_bit', default=8, type=int, help="activation precision used for all layers")
+    parser.add_argument('--weight_bit', default=8, type=int, help="weight precision used for all layers")
+    parser.add_argument('--bias_bit', default=32, type=int, help="bias precision used for all layers")
+    parser.add_argument('--fake_quant', default=True, type=bool, help="Set to True to use fake quantization, set to False to use integer quantization")
+    parser.add_argument('--activation_function', default="ReLU", type=str, help="Activation function used for each act layer.")
+    parser.add_argument('--execution-type', default='float', type=str, help="Select type of neural network and precision. Options are: float, quant, adapt. \n float: the neural network is executed with floating point precision.\n quant: the neural network weight, bias and activations are quantized to 8 bit\n adapt: the neural network is quantized to 8 bit and processed with exact/approximate multipliers")
+    parser.add_argument('--appr-level', default=0, type=int, help="Approximation level used in all layers (0 is exact)")
+    parser.add_argument('--appr-level-list', type=int, nargs=8, help="Exactly 8 integers specifying levels of approximation for each layer")
     return parser.parse_args()
 
 
 def main():
     args = get_args()
+    model_dir = "./fast_adversarial/AT_models/"
 
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
     if not os.path.exists(args.out_dir):
         os.mkdir(args.out_dir)
-    logfile = os.path.join(args.out_dir, 'output.log')
+    
+    if args.appr_level_list is None:
+        approximation_levels = [args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level]
+    else:
+        approximation_levels = args.appr_level_list
+    
+    if args.execution_type == "quant":
+        namebit = "_a"+str(args.act_bit)+"_w"+str(args.weight_bit)+"_b"+str(args.bias_bit)
+    else:
+        namebit = ""
+
+    if args.fake_quant:
+        namequant = "_fake"
+    else:
+        namequant = "_int"
+    dataset="cifar10"
+    num_classes=10
+    filename_model = "AT_" + args.neural_network + namebit + namequant + "_" + args.execution_type + "_" + dataset + "_" + args.activation_function + "_opt" + args.opt_level + "_alpha" + str(args.alpha) +"_epsilon" + str(args.epsilon) + "_" + str(args.epochs) + ".pth"
+    print(f'filename_model = {filename_model}')
+
+    output_log = "AT_" + args.neural_network + namebit + namequant + "_" + args.execution_type + "_" + dataset + "_" + args.activation_function + "_opt" + args.opt_level + "_alpha" + str(args.alpha) +"_epsilon" + str(args.epsilon) + "_" + str(args.epochs) + ".log"
+    logfile = os.path.join(args.out_dir, output_log)
     if os.path.exists(logfile):
         os.remove(logfile)
 
@@ -56,7 +91,7 @@ def main():
         format='[%(asctime)s] - %(message)s',
         datefmt='%Y/%m/%d %H:%M:%S',
         level=logging.INFO,
-        filename=os.path.join(args.out_dir, 'output.log'))
+        filename=os.path.join(args.out_dir, output_log))
     logger.info(args)
 
     np.random.seed(args.seed)
@@ -69,14 +104,25 @@ def main():
     alpha = (args.alpha / 255.) / std
     pgd_alpha = (2 / 255.) / std
 
-    model = PreActResNet18().cuda()
+    mode= {"execution_type":args.execution_type, "act_bit":args.act_bit, "weight_bit":args.weight_bit, "bias_bit":args.bias_bit, "fake_quant":args.fake_quant, "classes":num_classes, "act_type":args.activation_function}
+    if args.neural_network == "resnet8":
+        model = resnet8(mode).cuda()
+    elif args.neural_network == "resnet20":
+        model = resnet20(mode).cuda()
+    elif args.neural_network == "resnet32":
+        model = resnet32(mode).cuda()
+    elif args.neural_network == "resnet56":
+        model = resnet56(mode).cuda()
+    else:
+        exit("error unknown CNN model name")
     model.train()
 
     opt = torch.optim.SGD(model.parameters(), lr=args.lr_max, momentum=args.momentum, weight_decay=args.weight_decay)
     amp_args = dict(opt_level=args.opt_level, loss_scale=args.loss_scale, verbosity=False)
     if args.opt_level == 'O2':
         amp_args['master_weights'] = args.master_weights
-    model, opt = amp.initialize(model, opt, **amp_args)
+    if args.execution_type == 'float':
+        model, opt = amp.initialize(model, opt, **amp_args)
     criterion = nn.CrossEntropyLoss()
 
     if args.delta_init == 'previous':
@@ -111,8 +157,12 @@ def main():
             delta.requires_grad = True
             output = model(X + delta[:X.size(0)])
             loss = F.cross_entropy(output, y)
-            with amp.scale_loss(loss, opt) as scaled_loss:
-                scaled_loss.backward()
+            if args.execution_type == 'quant':
+                loss.backward()
+                opt.step()
+            else:
+                with amp.scale_loss(loss, opt) as scaled_loss:
+                    scaled_loss.backward()
             grad = delta.grad.detach()
             delta.data = clamp(delta + alpha * torch.sign(grad), -epsilon, epsilon)
             delta.data[:X.size(0)] = clamp(delta[:X.size(0)], lower_limit - X, upper_limit - X)
@@ -120,8 +170,11 @@ def main():
             output = model(X + delta[:X.size(0)])
             loss = criterion(output, y)
             opt.zero_grad()
-            with amp.scale_loss(loss, opt) as scaled_loss:
-                scaled_loss.backward()
+            if args.execution_type == 'quant':
+                loss.backward()               
+            else:
+                with amp.scale_loss(loss, opt) as scaled_loss:
+                    scaled_loss.backward()
             opt.step()
             train_loss += loss.item() * y.size(0)
             train_acc += (output.max(1)[1] == y).sum().item()
@@ -145,11 +198,23 @@ def main():
     train_time = time.time()
     if not args.early_stop:
         best_state_dict = model.state_dict()
-    torch.save(best_state_dict, os.path.join(args.out_dir, 'model.pth'))
+    torch.save(best_state_dict, os.path.join(model_dir, filename_model))
     logger.info('Total train time: %.4f minutes', (train_time - start_train_time)/60)
 
     # Evaluation
-    model_test = PreActResNet18().cuda()
+    if args.neural_network == "resnet8":
+        model_test = resnet8(mode).cuda()
+    elif args.neural_network == "resnet20":
+        model_test = resnet20(mode).cuda()
+    elif args.neural_network == "resnet32":
+        model_test = resnet32(mode).cuda()
+    elif args.neural_network == "resnet56":
+        model_test = resnet56(mode).cuda()
+    else:
+        exit("error unknown CNN model name")
+    
+
+    checkpoint = torch.load(model_dir + filename_model, map_location='cuda')
     model_test.load_state_dict(best_state_dict)
     model_test.float()
     model_test.eval()

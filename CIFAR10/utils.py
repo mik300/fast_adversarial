@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torch.utils.data.sampler import SubsetRandomSampler
 import numpy as np
+from tqdm import tqdm
 
 cifar10_mean = (0.4914, 0.4822, 0.4465)
 cifar10_std = (0.2471, 0.2435, 0.2616)
@@ -52,14 +53,17 @@ def get_loaders(dir_, batch_size):
     return train_loader, test_loader
 
 
-def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts, opt=None):
-    max_loss = torch.zeros(y.shape[0]).cuda()
-    max_delta = torch.zeros_like(X).cuda()
+def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts, device="cuda", opt=None):
+    max_loss = torch.zeros(y.shape[0]).to(device)
+    max_delta = torch.zeros_like(X).to(device)
+    lower_limit1 = lower_limit.to(device)
+    upper_limit1 = upper_limit.to(device)
     for zz in range(restarts):
-        delta = torch.zeros_like(X).cuda()
+        delta = torch.zeros_like(X).to(device)
         for i in range(len(epsilon)):
             delta[:, i, :, :].uniform_(-epsilon[i][0][0].item(), epsilon[i][0][0].item())
-        delta.data = clamp(delta, lower_limit - X, upper_limit - X)
+        delta.data = clamp(delta, lower_limit1 - X, upper_limit1 - X)
+        #print("delta device:", delta.device)
         delta.requires_grad = True
         for _ in range(attack_iters):
             output = model(X + delta)
@@ -71,7 +75,7 @@ def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts, opt=None):
                 with amp.scale_loss(loss, opt) as scaled_loss:
                     scaled_loss.backward()
             else:
-                loss.backward()
+                loss.backward()  # Call backward to compute gradients
             grad = delta.grad.detach()
             d = delta[index[0], :, :, :]
             g = grad[index[0], :, :, :]
@@ -85,16 +89,16 @@ def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts, opt=None):
     return max_delta
 
 
-def evaluate_pgd(test_loader, model, attack_iters, restarts):
-    epsilon = (8 / 255.) / std
-    alpha = (2 / 255.) / std
+def evaluate_pgd(test_loader, model, attack_iters, restarts, device="cuda"):
+    epsilon = ((8 / 255.) / std).to(device)
+    alpha = ((2 / 255.) / std).to(device)
     pgd_loss = 0
     pgd_acc = 0
     n = 0
     model.eval()
-    for i, (X, y) in enumerate(test_loader):
-        X, y = X.cuda(), y.cuda()
-        pgd_delta = attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts)
+    for i, (X, y) in enumerate(tqdm(test_loader)):
+        X, y = X.to(device), y.to(device)
+        pgd_delta = attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts, device)
         with torch.no_grad():
             output = model(X + pgd_delta)
             loss = F.cross_entropy(output, y)
@@ -104,14 +108,14 @@ def evaluate_pgd(test_loader, model, attack_iters, restarts):
     return pgd_loss/n, pgd_acc/n
 
 
-def evaluate_standard(test_loader, model):
+def evaluate_standard(test_loader, model, device="cuda"):
     test_loss = 0
     test_acc = 0
     n = 0
     model.eval()
     with torch.no_grad():
-        for i, (X, y) in enumerate(test_loader):
-            X, y = X.cuda(), y.cuda()
+        for i, (X, y) in enumerate(tqdm(test_loader)):
+            X, y = X.to(device), y.to(device)
             output = model(X)
             loss = F.cross_entropy(output, y)
             test_loss += loss.item() * y.size(0)
