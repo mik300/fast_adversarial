@@ -90,6 +90,7 @@ def attack_pgd(model, X, y, epsilon, alpha, attack_iters, restarts, device="cuda
 
 
 def evaluate_pgd(test_loader, model, attack_iters, restarts, device="cuda"):
+    print(f'Device used: {device}')
     epsilon = ((8 / 255.) / std).to(device)
     alpha = ((2 / 255.) / std).to(device)
     pgd_loss = 0

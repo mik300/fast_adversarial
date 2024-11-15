@@ -62,15 +62,15 @@ def get_args():
         help='If loss_scale is "dynamic", adaptively adjust the loss scale over time')
     parser.add_argument('--master-weights', action='store_true',
         help='Maintain FP32 master weights to accompany any FP16 model weights, not applicable for O1 opt level')
-    parser.add_argument('--neural_network', default="resnet8", type=str, help="Choose one from resnet8, resnet20, resnet32, resnet56")
-    parser.add_argument('--act_bit', default=8, type=int, help="activation precision used for all layers")
-    parser.add_argument('--weight_bit', default=8, type=int, help="weight precision used for all layers")
-    parser.add_argument('--bias_bit', default=32, type=int, help="bias precision used for all layers")
-    parser.add_argument('--fake_quant', default=True, type=bool, help="Set to True to use fake quantization, set to False to use integer quantization")
-    parser.add_argument('--activation_function', default="ReLU", type=str, help="Activation function used for each act layer.")
+    parser.add_argument('--neural-network', default="resnet8", type=str, help="Choose one from resnet8, resnet20, resnet32, resnet56")
+    parser.add_argument('--act-bit', default=8, type=int, help="activation precision used for all layers")
+    parser.add_argument('--weight-bit', default=8, type=int, help="weight precision used for all layers")
+    parser.add_argument('--bias-bit', default=32, type=int, help="bias precision used for all layers")
+    parser.add_argument('--fake-quant', default=True, type=bool, help="Set to True to use fake quantization, set to False to use integer quantization")
+    parser.add_argument('--activation-function', default="ReLU", type=str, help="Activation function used for each act layer.")
     parser.add_argument('--execution-type', default='quant', type=str, help="Select type of neural network and precision. Options are: float, quant, adapt. \n float: the neural network is executed with floating point precision.\n quant: the neural network weight, bias and activations are quantized to 8 bit\n adapt: the neural network is quantized to 8 bit and processed with exact/approximate multipliers")
-    parser.add_argument('--appr_level', default=0, type=int, help="Approximation level used in all layers (0 is exact)")
-    parser.add_argument('--appr_level_list', type=int, nargs=8, help="Exactly 8 integers specifying levels of approximation for each layer")
+    parser.add_argument('--appr-level', default=0, type=int, help="Approximation level used in all layers (0 is exact)")
+    parser.add_argument('--appr-level-list', type=int, nargs=8, help="Exactly 8 integers specifying levels of approximation for each layer")
     return parser.parse_args()
 
 
@@ -106,7 +106,7 @@ def main():
     filename = model_dir + args.neural_network + namebit + namequant + "_" + execution_type + "_" + dataset + "_" + args.activation_function + ".pth"
     filename_sc = model_dir + args.neural_network + namebit + namequant + "_" + execution_type + "_" + dataset +"_" + args.activation_function + '_scaling_factors.pkl'
 
-    output_log = "no_AT_" + args.neural_network + namebit + namequant + "_" + args.execution_type + "_" + args.execution_type + "_" + dataset + "_" + args.activation_function  + "_alpha" + str(args.alpha) +"_epsilon" + str(args.epsilon) + "_" + str(args.epochs) + ".log"
+    output_log = "no_AT_" + args.neural_network + namebit + namequant + "_" + args.execution_type + "_" + dataset + "_" + args.activation_function  + "_alpha" + str(args.alpha) +"_epsilon" + str(args.epsilon) + "_" + str(args.epochs) + ".log"
     logfile = os.path.join(args.out_dir, output_log)
     if os.path.exists(logfile):
         os.remove(logfile)

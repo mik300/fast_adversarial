@@ -43,12 +43,12 @@ def get_args():
         help='If loss_scale is "dynamic", adaptively adjust the loss scale over time')
     parser.add_argument('--master-weights', action='store_true',
         help='Maintain FP32 master weights to accompany any FP16 model weights, not applicable for O1 opt level')
-    parser.add_argument('--neural_network', default="resnet8", type=str, help="Choose one from resnet8, resnet20, resnet32, resnet56")
-    parser.add_argument('--act_bit', default=8, type=int, help="activation precision used for all layers")
-    parser.add_argument('--weight_bit', default=8, type=int, help="weight precision used for all layers")
-    parser.add_argument('--bias_bit', default=32, type=int, help="bias precision used for all layers")
-    parser.add_argument('--fake_quant', default=True, type=bool, help="Set to True to use fake quantization, set to False to use integer quantization")
-    parser.add_argument('--activation_function', default="ReLU", type=str, help="Activation function used for each act layer.")
+    parser.add_argument('--neural-network', default="resnet8", type=str, help="Choose one from resnet8, resnet20, resnet32, resnet56")
+    parser.add_argument('--act-bit', default=8, type=int, help="activation precision used for all layers")
+    parser.add_argument('--weight-bit', default=8, type=int, help="weight precision used for all layers")
+    parser.add_argument('--bias-bit', default=32, type=int, help="bias precision used for all layers")
+    parser.add_argument('--fake-quant', default=True, type=bool, help="Set to True to use fake quantization, set to False to use integer quantization")
+    parser.add_argument('--activation-function', default="ReLU", type=str, help="Activation function used for each act layer.")
     parser.add_argument('--execution-type', default='float', type=str, help="Select type of neural network and precision. Options are: float, quant, adapt. \n float: the neural network is executed with floating point precision.\n quant: the neural network weight, bias and activations are quantized to 8 bit\n adapt: the neural network is quantized to 8 bit and processed with exact/approximate multipliers")
     parser.add_argument('--appr-level', default=0, type=int, help="Approximation level used in all layers (0 is exact)")
     parser.add_argument('--appr-level-list', type=int, nargs=8, help="Exactly 8 integers specifying levels of approximation for each layer")
@@ -62,6 +62,13 @@ def main():
     Path(model_dir).mkdir(parents=True, exist_ok=True)
     if not os.path.exists(args.out_dir):
         os.mkdir(args.out_dir)
+
+    if args.execution_type == 'adapt':
+        device = "cpu"
+        torch.set_num_threads(args.threads)
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f'Device used: {device}')
     
     if args.appr_level_list is None:
         approximation_levels = [args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level]
@@ -73,10 +80,15 @@ def main():
     else:
         namebit = ""
 
-    if args.fake_quant:
-        namequant = "_fake"
+    if args.execution_type == "quant":
+        if args.fake_quant:
+            namequant = "_fake"
+        else:
+            namequant = "_int"
     else:
-        namequant = "_int"
+        namequant = ""
+    
+
     dataset="cifar10"
     num_classes=10
     filename_model = "AT_" + args.neural_network + namebit + namequant + "_" + args.execution_type + "_" + dataset + "_" + args.activation_function + "_opt" + args.opt_level + "_alpha" + str(args.alpha) +"_epsilon" + str(args.epsilon) + "_" + str(args.epochs) + ".pth"
@@ -104,7 +116,7 @@ def main():
     alpha = (args.alpha / 255.) / std
     pgd_alpha = (2 / 255.) / std
 
-    mode= {"execution_type":args.execution_type, "act_bit":args.act_bit, "weight_bit":args.weight_bit, "bias_bit":args.bias_bit, "fake_quant":args.fake_quant, "classes":num_classes, "act_type":args.activation_function}
+    mode = {"execution_type":args.execution_type, "act_bit":args.act_bit, "weight_bit":args.weight_bit, "bias_bit":args.bias_bit, "fake_quant":args.fake_quant, "classes":num_classes, "act_type":args.activation_function}
     if args.neural_network == "resnet8":
         model = resnet8(mode).cuda()
     elif args.neural_network == "resnet20":
@@ -139,6 +151,7 @@ def main():
     prev_robust_acc = 0.
     start_train_time = time.time()
     logger.info('Epoch \t Seconds \t LR \t \t Train Loss \t Train Acc')
+    print("Training model, see log file for details")
     for epoch in range(args.epochs):
         start_epoch_time = time.time()
         train_loss = 0
@@ -198,7 +211,19 @@ def main():
     train_time = time.time()
     if not args.early_stop:
         best_state_dict = model.state_dict()
-    torch.save(best_state_dict, os.path.join(model_dir, filename_model))
+    #torch.save(best_state_dict, os.path.join(model_dir, filename_model))
+    test_loss, test_acc = evaluate_standard(test_loader, model)
+    torch.save({
+                'epoch': epoch,
+                'model_state_dict': best_state_dict,
+                'train_loss': train_loss/train_n,
+                'train_acc': train_acc/train_n,
+                'test_loss': test_loss,
+                'test_acc': test_acc,
+                'device': device,
+                'train_parameters': {'batch': args.batch_size, 'epochs': args.epochs, 'lr': args.lr_min,
+                                     'wd': args.weight_decay}
+            }, os.path.join(model_dir, filename_model))
     logger.info('Total train time: %.4f minutes', (train_time - start_train_time)/60)
 
     # Evaluation
@@ -215,11 +240,13 @@ def main():
     
 
     checkpoint = torch.load(model_dir + filename_model, map_location='cuda')
-    model_test.load_state_dict(best_state_dict)
+    model_test.load_state_dict(checkpoint['model_state_dict'])
     model_test.float()
     model_test.eval()
 
+    print("Evaluating accuracy under PGD...")
     pgd_loss, pgd_acc = evaluate_pgd(test_loader, model_test, 50, 10)
+    print("Evaluating standard accuracy...")
     test_loss, test_acc = evaluate_standard(test_loader, model_test)
 
     logger.info('Test Loss \t Test Acc \t PGD Loss \t PGD Acc')
