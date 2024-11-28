@@ -3,6 +3,7 @@ import copy
 import logging
 import os
 import time
+import sys
 
 import numpy as np
 import torch
@@ -16,7 +17,10 @@ from fast_adversarial.CIFAR10.utils import (upper_limit, lower_limit, std, clamp
     attack_pgd, evaluate_pgd, evaluate_standard)
 from neural_networks.CIFAR10.resnet import resnet8, resnet20, resnet32, resnet56
 from neural_networks.utils import get_loaders_split, evaluate_test_accuracy, calibrate_model, load_scaling_factors
+import warnings
 
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +56,7 @@ def get_args():
     parser.add_argument('--execution-type', default='float', type=str, help="Select type of neural network and precision. Options are: float, quant, adapt. \n float: the neural network is executed with floating point precision.\n quant: the neural network weight, bias and activations are quantized to 8 bit\n adapt: the neural network is quantized to 8 bit and processed with exact/approximate multipliers")
     parser.add_argument('--appr-level', default=0, type=int, help="Approximation level used in all layers (0 is exact)")
     parser.add_argument('--appr-level-list', type=int, nargs=8, help="Exactly 8 integers specifying levels of approximation for each layer")
+    parser.add_argument('--threads', default=12, type=int, help="Number of threads used during the inference, used only when neural-network-type is set to adapt")
     return parser.parse_args()
 
 
@@ -75,12 +80,12 @@ def main():
     else:
         approximation_levels = args.appr_level_list
     
-    if args.execution_type == "quant":
+    if args.execution_type == "quant" or args.execution_type == "adapt":
         namebit = "_a"+str(args.act_bit)+"_w"+str(args.weight_bit)+"_b"+str(args.bias_bit)
     else:
         namebit = ""
 
-    if args.execution_type == "quant":
+    if args.execution_type == "quant" or args.execution_type == "adapt":
         if args.fake_quant:
             namequant = "_fake"
         else:
@@ -98,6 +103,10 @@ def main():
     logfile = os.path.join(args.out_dir, output_log)
     if os.path.exists(logfile):
         os.remove(logfile)
+
+    if args.execution_type == "quant" or args.execution_type == "adapt":
+        filename_sc = "./neural_networks/models/" + args.neural_network + namebit + namequant + "_" + "quant" + "_" + dataset +"_" + args.activation_function + '_scaling_factors.pkl'
+        print(f'Scaling factors loaded from {filename_sc} and assigned to the model')
 
     logging.basicConfig(
         format='[%(asctime)s] - %(message)s',
@@ -118,27 +127,30 @@ def main():
 
     mode = {"execution_type":args.execution_type, "act_bit":args.act_bit, "weight_bit":args.weight_bit, "bias_bit":args.bias_bit, "fake_quant":args.fake_quant, "classes":num_classes, "act_type":args.activation_function}
     if args.neural_network == "resnet8":
-        model = resnet8(mode).cuda()
+        model = resnet8(mode).to(device)
     elif args.neural_network == "resnet20":
-        model = resnet20(mode).cuda()
+        model = resnet20(mode).to(device)
     elif args.neural_network == "resnet32":
-        model = resnet32(mode).cuda()
+        model = resnet32(mode).to(device)
     elif args.neural_network == "resnet56":
-        model = resnet56(mode).cuda()
+        model = resnet56(mode).to(device)
     else:
         exit("error unknown CNN model name")
+    
+    if args.execution_type == "quant" or args.execution_type == "adapt":
+        load_scaling_factors(model, filename_sc, device)
     model.train()
 
     opt = torch.optim.SGD(model.parameters(), lr=args.lr_max, momentum=args.momentum, weight_decay=args.weight_decay)
     amp_args = dict(opt_level=args.opt_level, loss_scale=args.loss_scale, verbosity=False)
     if args.opt_level == 'O2':
         amp_args['master_weights'] = args.master_weights
-    if args.execution_type == 'float':
+    if args.execution_type == 'float' or args.execution_type == "adapt":
         model, opt = amp.initialize(model, opt, **amp_args)
     criterion = nn.CrossEntropyLoss()
 
     if args.delta_init == 'previous':
-        delta = torch.zeros(args.batch_size, 3, 32, 32).cuda()
+        delta = torch.zeros(args.batch_size, 3, 32, 32).to(device)
 
     lr_steps = args.epochs * len(train_loader)
     if args.lr_schedule == 'cyclic':
@@ -158,32 +170,37 @@ def main():
         train_acc = 0
         train_n = 0
         for i, (X, y) in enumerate(train_loader):
-            X, y = X.cuda(), y.cuda()
+            X, y = X.to(device), y.to(device)
             if i == 0:
                 first_batch = (X, y)
             if args.delta_init != 'previous':
-                delta = torch.zeros_like(X).cuda()
+                delta = torch.zeros_like(X).to(device)
             if args.delta_init == 'random':
                 for j in range(len(epsilon)):
                     delta[:, j, :, :].uniform_(-epsilon[j][0][0].item(), epsilon[j][0][0].item())
-                delta.data = clamp(delta, lower_limit - X, upper_limit - X)
+                delta.data = clamp(delta, lower_limit.to(device) - X, upper_limit.to(device) - X)
+
             delta.requires_grad = True
             output = model(X + delta[:X.size(0)])
             loss = F.cross_entropy(output, y)
-            if args.execution_type == 'quant':
+            #print(f'output.dtype = {output.dtype}')
+            #print(f"delta grad_fn after addition: {delta.grad_fn}")
+            if args.execution_type == 'quant' or args.execution_type == 'adapt':
                 loss.backward()
                 opt.step()
             else:
                 with amp.scale_loss(loss, opt) as scaled_loss:
                     scaled_loss.backward()
             grad = delta.grad.detach()
+            #sys.exit("Stopped execution for debuggin")
+
             delta.data = clamp(delta + alpha * torch.sign(grad), -epsilon, epsilon)
-            delta.data[:X.size(0)] = clamp(delta[:X.size(0)], lower_limit - X, upper_limit - X)
+            delta.data[:X.size(0)] = clamp(delta[:X.size(0)], lower_limit.to(device) - X, upper_limit.to(device) - X)
             delta = delta.detach()
             output = model(X + delta[:X.size(0)])
             loss = criterion(output, y)
             opt.zero_grad()
-            if args.execution_type == 'quant':
+            if args.execution_type == 'quant' or args.execution_type == 'adapt':
                 loss.backward()               
             else:
                 with amp.scale_loss(loss, opt) as scaled_loss:
@@ -198,7 +215,7 @@ def main():
             X, y = first_batch
             pgd_delta = attack_pgd(model, X, y, epsilon, pgd_alpha, 5, 1, opt)
             with torch.no_grad():
-                output = model(clamp(X + pgd_delta[:X.size(0)], lower_limit, upper_limit))
+                output = model(clamp(X + pgd_delta[:X.size(0)], lower_limit.to(device), upper_limit.to(device)))
             robust_acc = (output.max(1)[1] == y).sum().item() / y.size(0)
             if robust_acc - prev_robust_acc < -0.2:
                 break
@@ -211,7 +228,7 @@ def main():
     train_time = time.time()
     if not args.early_stop:
         best_state_dict = model.state_dict()
-    #torch.save(best_state_dict, os.path.join(model_dir, filename_model))
+
     test_loss, test_acc = evaluate_standard(test_loader, model)
     torch.save({
                 'epoch': epoch,
@@ -228,18 +245,18 @@ def main():
 
     # Evaluation
     if args.neural_network == "resnet8":
-        model_test = resnet8(mode).cuda()
+        model_test = resnet8(mode).to(device)
     elif args.neural_network == "resnet20":
-        model_test = resnet20(mode).cuda()
+        model_test = resnet20(mode).to(device)
     elif args.neural_network == "resnet32":
-        model_test = resnet32(mode).cuda()
+        model_test = resnet32(mode).to(device)
     elif args.neural_network == "resnet56":
-        model_test = resnet56(mode).cuda()
+        model_test = resnet56(mode).to(device)
     else:
         exit("error unknown CNN model name")
     
 
-    checkpoint = torch.load(model_dir + filename_model, map_location='cuda')
+    checkpoint = torch.load(model_dir + filename_model, map_location=device)
     model_test.load_state_dict(checkpoint['model_state_dict'])
     model_test.float()
     model_test.eval()
