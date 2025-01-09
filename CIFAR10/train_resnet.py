@@ -1,5 +1,6 @@
 import argparse
 import copy
+from absl import logging as absl_logging
 import logging
 import os
 import time
@@ -16,12 +17,12 @@ from pathlib import Path
 from fast_adversarial.CIFAR10.utils import (upper_limit, lower_limit, std, clamp, get_loaders,
     attack_pgd, evaluate_pgd, evaluate_standard)
 from neural_networks.CIFAR10.resnet import resnet8, resnet20, resnet32, resnet56
-from neural_networks.utils import get_loaders_split, evaluate_test_accuracy, calibrate_model, load_scaling_factors
+from neural_networks.utils import get_loaders_split, evaluate_test_accuracy, calibrate_model, load_scaling_factors, init_transaxx_train, init_transaxx
 import warnings
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
 
 def get_args():
@@ -29,9 +30,9 @@ def get_args():
     parser.add_argument('--batch-size', default=128, type=int)
     parser.add_argument('--data-dir', default='./data', type=str)
     parser.add_argument('--epochs', default=5, type=int)
-    parser.add_argument('--lr-schedule', default='cyclic', choices=['cyclic', 'multistep'])
-    parser.add_argument('--lr-min', default=0., type=float)
-    parser.add_argument('--lr-max', default=0.2, type=float)
+    parser.add_argument('--lr-schedule', default='cyclic', choices=['cyclic', 'multistep', 'step'])
+    parser.add_argument('--lr-min', default=1e-4, type=float)
+    parser.add_argument('--lr-max', default=1e-1, type=float)
     parser.add_argument('--weight-decay', default=5e-4, type=float)
     parser.add_argument('--momentum', default=0.9, type=float)
     parser.add_argument('--epsilon', default=8, type=int)
@@ -54,9 +55,11 @@ def get_args():
     parser.add_argument('--fake-quant', default=True, type=bool, help="Set to True to use fake quantization, set to False to use integer quantization")
     parser.add_argument('--activation-function', default="ReLU", type=str, help="Activation function used for each act layer.")
     parser.add_argument('--execution-type', default='float', type=str, help="Select type of neural network and precision. Options are: float, quant, adapt. \n float: the neural network is executed with floating point precision.\n quant: the neural network weight, bias and activations are quantized to 8 bit\n adapt: the neural network is quantized to 8 bit and processed with exact/approximate multipliers")
-    parser.add_argument('--appr-level', default=0, type=int, help="Approximation level used in all layers (0 is exact)")
-    parser.add_argument('--appr-level-list', type=int, nargs=8, help="Exactly 8 integers specifying levels of approximation for each layer")
+    parser.add_argument('--axx-level', default=0, type=int, help="Approximation level used in all layers (0 is exact)")
+    parser.add_argument('--axx-level-list', type=int, nargs=8, help="Exactly 8 integers specifying levels of approximation for each layer")
     parser.add_argument('--threads', default=12, type=int, help="Number of threads used during the inference, used only when neural-network-type is set to adapt")
+    parser.add_argument('--transaxx-quant', default=8, type=int, help="")
+    parser.add_argument('--reload', default=0, type=int, help="")
     return parser.parse_args()
 
 
@@ -75,17 +78,19 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f'Device used: {device}')
     
-    if args.appr_level_list is None:
-        approximation_levels = [args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level, args.appr_level]
+    if args.axx_level_list is None:
+        approximation_levels = [args.axx_level, args.axx_level, args.axx_level, args.axx_level, args.axx_level, args.axx_level, args.axx_level, args.axx_level]
     else:
-        approximation_levels = args.appr_level_list
+        approximation_levels = args.axx_level_list
     
     if args.execution_type == "quant" or args.execution_type == "adapt":
         namebit = "_a"+str(args.act_bit)+"_w"+str(args.weight_bit)+"_b"+str(args.bias_bit)
+    elif args.execution_type == "transaxx":
+        namebit = f"_{args.transaxx_quant}x{args.transaxx_quant}"
     else:
         namebit = ""
 
-    if args.execution_type == "quant" or args.execution_type == "adapt":
+    if args.execution_type == "quant" or args.execution_type == "adapt" or args.execution_type == "transaxx":
         if args.fake_quant:
             namequant = "_fake"
         else:
@@ -100,19 +105,33 @@ def main():
     print(f'filename_model = {filename_model}')
 
     output_log = "AT_" + args.neural_network + namebit + namequant + "_" + args.execution_type + "_" + dataset + "_" + args.activation_function + "_opt" + args.opt_level + "_alpha" + str(args.alpha) +"_epsilon" + str(args.epsilon) + "_" + str(args.epochs) + ".log"
+    print(f'args.out_dir = {args.out_dir}')
+    print(f'logfile = {output_log}')
     logfile = os.path.join(args.out_dir, output_log)
     if os.path.exists(logfile):
         os.remove(logfile)
 
+    absl_logging.set_verbosity(absl_logging.INFO) 
+    log_formatter = logging.Formatter('[%(asctime)s] - %(message)s', datefmt='%Y/%m/%d %H:%M:%S')
+    file_handler = logging.FileHandler(os.path.join(args.out_dir, output_log), mode='a')
+    file_handler.setFormatter(log_formatter)
+    #absl_logging.use_absl_handler()
+    # Get the logger
+    #logger = absl_logging.get_absl_logger()
+    logger = logging.getLogger('my_custom_logger')
+    logger.setLevel(logging.INFO)
+    # Add custom file handler to the ABSL logger
+    logger.addHandler(file_handler)
+    logging.getLogger('absl').setLevel(logging.WARNING)
     if args.execution_type == "quant" or args.execution_type == "adapt":
         filename_sc = "./neural_networks/models/" + args.neural_network + namebit + namequant + "_" + "quant" + "_" + dataset +"_" + args.activation_function + '_scaling_factors.pkl'
         print(f'Scaling factors loaded from {filename_sc} and assigned to the model')
 
-    logging.basicConfig(
-        format='[%(asctime)s] - %(message)s',
-        datefmt='%Y/%m/%d %H:%M:%S',
-        level=logging.INFO,
-        filename=os.path.join(args.out_dir, output_log))
+    # logging.basicConfig(
+    #     format='[%(asctime)s] - %(message)s',
+    #     datefmt='%Y/%m/%d %H:%M:%S',
+    #     level=logging.INFO,
+    #     filename=os.path.join(args.out_dir, output_log))
     logger.info(args)
 
     np.random.seed(args.seed)
@@ -137,15 +156,31 @@ def main():
     else:
         exit("error unknown CNN model name")
     
+
+    if args.reload:
+
+        if args.execution_type == "transaxx" or args.execution_type == "quant":
+            checkpoint = torch.load("neural_networks/models/resnet32_a8_w8_b32_fake_quant_cifar10_ReLU_calibrated.pth", map_location=device)
+        else:
+            checkpoint = torch.load("neural_networks/models/resnet32_float_cifar10_ReLU.pth", map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        model.to(device)
+        args.epochs = args.epochs - checkpoint['epoch']
+        print(f'continuing training for {args.epochs} epochs')
+
+    if args.execution_type == "transaxx":
+       init_transaxx_train(model, approximation_levels, args, args.transaxx_quant, device, args.fake_quant)
+
     if args.execution_type == "quant" or args.execution_type == "adapt":
         load_scaling_factors(model, filename_sc, device)
-    model.train()
+
+    
 
     opt = torch.optim.SGD(model.parameters(), lr=args.lr_max, momentum=args.momentum, weight_decay=args.weight_decay)
     amp_args = dict(opt_level=args.opt_level, loss_scale=args.loss_scale, verbosity=False)
     if args.opt_level == 'O2':
         amp_args['master_weights'] = args.master_weights
-    if args.execution_type == 'float' or args.execution_type == "adapt":
+    if args.execution_type == 'float':
         model, opt = amp.initialize(model, opt, **amp_args)
     criterion = nn.CrossEntropyLoss()
 
@@ -158,12 +193,20 @@ def main():
             step_size_up=lr_steps / 2, step_size_down=lr_steps / 2)
     elif args.lr_schedule == 'multistep':
         scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[lr_steps / 2, lr_steps * 3 / 4], gamma=0.1)
+    elif args.lr_schedule == 'step':
+        opt = torch.optim.SGD(model.parameters(), lr=0.0005)
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=2, gamma=0.9)
 
+    model.eval()
+    _, test_acc = evaluate_test_accuracy(test_loader, model, device)
+    print(f'Initial test accuracy: {test_acc}')
+    model.train()
     # Training
     prev_robust_acc = 0.
     start_train_time = time.time()
     logger.info('Epoch \t Seconds \t LR \t \t Train Loss \t Train Acc')
     print("Training model, see log file for details")
+    # sys.exit("Stopped execution for debuggin")
     for epoch in range(args.epochs):
         start_epoch_time = time.time()
         train_loss = 0
@@ -185,7 +228,7 @@ def main():
             loss = F.cross_entropy(output, y)
             #print(f'output.dtype = {output.dtype}')
             #print(f"delta grad_fn after addition: {delta.grad_fn}")
-            if args.execution_type == 'quant' or args.execution_type == 'adapt':
+            if args.execution_type == 'quant' or args.execution_type == 'adapt' or args.execution_type == 'transaxx':
                 loss.backward()
                 opt.step()
             else:
@@ -200,7 +243,7 @@ def main():
             output = model(X + delta[:X.size(0)])
             loss = criterion(output, y)
             opt.zero_grad()
-            if args.execution_type == 'quant' or args.execution_type == 'adapt':
+            if args.execution_type == 'quant' or args.execution_type == 'adapt' or args.execution_type == 'transaxx':
                 loss.backward()               
             else:
                 with amp.scale_loss(loss, opt) as scaled_loss:
@@ -209,7 +252,7 @@ def main():
             train_loss += loss.item() * y.size(0)
             train_acc += (output.max(1)[1] == y).sum().item()
             train_n += y.size(0)
-            scheduler.step()
+            #scheduler.step()
         if args.early_stop:
             # Check current PGD robustness of model using random minibatch
             X, y = first_batch
@@ -221,6 +264,7 @@ def main():
                 break
             prev_robust_acc = robust_acc
             best_state_dict = copy.deepcopy(model.state_dict())
+        scheduler.step()
         epoch_time = time.time()
         lr = scheduler.get_lr()[0]
         logger.info('%d \t %.1f \t \t %.4f \t %.4f \t %.4f',
@@ -255,6 +299,8 @@ def main():
     else:
         exit("error unknown CNN model name")
     
+    if args.execution_type == "transaxx":
+       init_transaxx_train(model_test, [0], args, args.transaxx_quant, device, args.fake_quant)
 
     checkpoint = torch.load(model_dir + filename_model, map_location=device)
     model_test.load_state_dict(checkpoint['model_state_dict'])
