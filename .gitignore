@@ -3,3 +3,4 @@ log/
 AT_models/*
 CIFAR10/apex/
 CIFAR10/read_pth.py
+!AT_models/.gitkeep
