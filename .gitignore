@@ -1,5 +1,5 @@
 *.pyc
 log/
-AT_models/
+AT_models/*
 CIFAR10/apex/
 CIFAR10/read_pth.py
